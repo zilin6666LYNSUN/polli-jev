@@ -1,65 +1,91 @@
-# 🧿 Jev 裁决台 · Decision Desk
+# jev-referee
 
-一个纯静态、零构建依赖的决策工具 Web App：把文本决策交给 **Pollinations Jev**（`/alpha/decisions` 端点），并把结构化决策渲染成可操作的 UI。
+A Pollinations **code agent** that lifts one repeated decision out of the agent
+loop and hands it to Jev: *"is this run done, in progress, stuck, or blocked?"*
 
-- **创业点子裁决**：输入创业想法，Jev 用 `choice` 类型在 **Kill / Fix / Ship** 三个标准中裁决，输出裁决卡（结果 + 置信度 + 三选项概率条形图 + 依据说明）。
-- **语义过滤器**：粘贴一组头条/评论（每行一条），Jev 用 `score` 类型逐项打 0-100 分，渲染可排序的分数条列表，可一键保留高分项（≥70）。
-- **紧急度判断**：输入一段求助/待办文本，Jev 用 `noul` 类型给出 0-1 紧急程度，渲染紧急度仪表盘并给出建议动作。
+Every tool loop asks that question after every tool call, and most agents
+answer it implicitly inside an ever-growing prompt. This agent makes it an
+explicit, calibrated, inspectable decision — `POST /alpha/decisions` with a
+`choice` question — and then **acts strictly on the verdict**: a normal text
+model summarizes the result, names the next step, proposes an alternative, or
+asks the user for exactly what is missing.
 
-## 本地运行
+Callable model: **`community/zilin6666LYNSUN/jev-referee`**
 
-无需安装任何依赖，直接用浏览器打开 `index.html` 即可完整体验。
+## How a request is handled
 
-> 未连接钱包时自动进入**演示模式**：预置 3 组示例请求与响应，展示完整 UI 效果，绝不报错阻塞；点击"连接钱包"后即可实时调用 Jev。
+The caller sends the current run state in a plain message:
 
-## BYOP 说明（为什么需要登录）
+```
+Goal: 把周报写到 D:\reports\week30.md
+Latest tool output: Error: EACCES: permission denied, open 'D:\reports\week30.md'（连续第 3 次相同错误）
+```
 
-`https://gen.pollinations.ai/alpha/decisions` 是 **BYOP（Bring Your Own Pollen）** 付费端点：匿名调用返回 `401`，必须携带你自己的 `sk_` API Key（付费 Pollen）才能实时决策。
+If the markers are missing, the whole input is treated as the goal and Jev
+still classifies the run.
 
-本应用采用官方 **fragment flow** 登录：
+1. **Ask Jev.** The goal and the latest tool output go into the `state`; one
+   `choice` question asks for the run status:
 
-1. 点击顶栏「连接钱包」，跳转 `https://enter.pollinations.ai/authorize?redirect_uri=当前页面URL&scope=usage&client_id=`
-2. 授权完成后回调地址会带上 `#api_key=sk_...`
-3. 应用读取 hash 中的 key 后**立即清空地址栏**，key 仅保存在内存中，**绝不写入 localStorage / 落盘**
-4. 之后所有 `/alpha/decisions` 请求携带 `Authorization: Bearer sk_...`
+   | Choice | Meaning |
+   | --- | --- |
+   | `done` | The goal has been fully achieved; the latest tool output shows the final result and no further action is needed |
+   | `in-progress` | Work is advancing; partial progress is visible and the next step is clear |
+   | `stuck` | The latest tool output shows an error, repeated failure, or an unresolvable obstacle; a different approach is needed |
+   | `blocked` | The agent cannot proceed until the user provides something (credentials, a choice, a missing file, clarification) |
 
-**安全提示**：key 只存活于内存，刷新页面即失效，需要重新登录；这也意味着 key 不会在你的磁盘上留下痕迹。
+2. **Act on the verdict.** The agent picks one of four system prompts and
+   forwards goal + output to the requested model (default
+   `openai/gpt-5.4-nano`):
+   - `done` → summarize the delivered result;
+   - `in-progress` → state the single next step;
+   - `stuck` → diagnose and propose one concrete alternative;
+   - `blocked` → list exactly what the user must provide.
 
-## 请求 / 响应格式
+3. **Return with the decision visible.** Every answer carries
+   `x-jev-status`, `x-jev-probabilities` and `x-jev-model` headers, and JSON
+   bodies include a `jev` object with the same data, so callers can see which
+   decision was made and how confident Jev was, without re-running anything.
 
-请求体（参照官方 APIDOCS）：
+## Live runs
+
+Four calls against `gen.pollinations.ai`, each with a different run state.
+Jev classified all four correctly, with near-certain probabilities, and the
+acting model produced the matching output shape:
+
+| Case | Jev verdict | Probabilities | Acting model output |
+| --- | --- | --- | --- |
+| File written successfully | `done` | `{done: 1.00}` | Summarizes the delivered file (path, size, contents) |
+| Directory created, content pending | `in-progress` | `{in-progress: 1.00}` | Names the single next step (write the content to the file) |
+| `EACCES` permission denied, 3rd time | `stuck` | `{stuck: 0.99, blocked: 0.01}` | Diagnoses the permission issue and proposes writing to a user-writable path |
+| VPN login failed, needs verification code | `blocked` | `{blocked: 1.00}` | Lists exactly what the user must provide (the code, or an alternative) |
+
+Example decision payload Jev returned for the `done` case:
 
 ```json
 {
-  "state": "<背景文本>",
-  "questions": {
-    "<键>": {
-      "type": "choice | score | noul",
-      "instructions": "<指令>",
-      "criteria": { "kill": "...", "fix": "...", "ship": "..." }
+  "model": "typesafe/jev-1.13",
+  "answers": {
+    "status": {
+      "type": "choice",
+      "choice": "done",
+      "probabilities": { "done": 1, "in-progress": 0, "stuck": 0, "blocked": 0 }
     }
   }
 }
 ```
 
-响应 `answers` 中每项按 `type` 返回：
+## Repo layout
 
-| type | 字段 |
-|---|---|
-| `choice` | `choice` + `confidence` + `probabilities`（键值概率映射） |
-| `score` | `score`（0-100）+ `legend` + `confidence` |
-| `noul` | `noul`（0-1） |
+- `agent.ts` — the code agent (runs at the root of this public repository).
+- `agent.test.ts` — unit tests for all four verdict branches plus error
+  handling. Run with `node --test agent.test.ts` (Node 22+ runs TypeScript
+  directly). 6/6 pass.
+- `index.html`, `script.js`, `styles.css` — a static Jev decision-desk demo
+  that ships in this repository as a secondary playground.
 
-## 部署到 GitHub Pages
+## Deploy
 
-1. 在 GitHub 新建仓库，上传 `index.html` / `styles.css` / `script.js` / `README.md`（四个文件放在仓库根目录即可）。
-2. 打开仓库 **Settings → Pages**，Source 选择 `Deploy from a branch`，分支选 `main`，目录选 `/ (root)`。
-3. 保存后等待 1-2 分钟，访问 `https://<你的用户名>.github.io/<仓库名>/` 即上线。
-
-> 上线后点击「连接钱包」时，回调的 `redirect_uri` 会自动使用当前线上 URL，无需修改代码。
-
-## 隐私
-
-- 历史决策记录仅保存在**本机 localStorage**，可随时清空。
-- API Key 仅存在内存，页面刷新即消失。
-- 纯静态三件套，无后端、无埋点、无第三方依赖（仅调用 Pollinations 官方决策 API）。
+In [My Models](https://enter.pollinations.ai/my-models), **Add Agent → Code
+agent**, set the repository to this GitHub repository, and publish. The
+callable model name is derived from the GitHub username and repository name.
